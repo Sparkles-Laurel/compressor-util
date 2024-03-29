@@ -1,52 +1,47 @@
 #[macro_use]
 extern crate rocket;
-use std::fs::File;
 
 // use zstd compression
 // also use the libraries for receiving files
-use rocket::data::{ByteUnit, Limits};
-use rocket::http::ContentType;
-use rocket::http::Header;
-use rocket::http::Status;
-use rocket::response::stream::ByteStream;
-use rocket::response::Response;
-use std::io::{self, BufReader, Cursor, Read, Write};
+use rocket::{fs::TempFile, http::{Header, Status}, response::Response, tokio::io::AsyncReadExt};
+use std::io::{Cursor, Read, Write};
 use tempfile::tempfile;
 use uuid::Uuid;
-use zstd::stream::copy_encode;
-use zstd::stream::read::Decoder;
 use zstd::stream::write::Encoder;
-use zstd::stream::zio::Reader;
+
+fn consume<'a, T>(r: &'a T) -> &'static T {
+    r
+}
 
 #[post("/compress", data = "<file>")]
-fn compress<'a>(file: File) -> Result<Response<'a>, Status> {
-    let mut encoder = match Encoder::new(file, 19) {
+async fn compress<'a>(file: TempFile<'_>) -> Result<Response<'a>, Status> {
+    // let a temporary file that the buffer will be saved into
+    let mut buffer = match tempfile() {
+        Ok(file) => file,
+        Err(_) => return Err(Status::InternalServerError),
+    };
+
+    let mut buffer1 = Vec::new();
+
+    if let Ok(mut file) = file.open().await {
+        file.read_to_end(&mut buffer1);
+    } else {
+        return Err(Status::InternalServerError);
+    }
+
+    if let Err(_) = buffer.write_all(&mut buffer1) {
+        return Err(Status::InternalServerError);
+    }
+
+    let encoder = match Encoder::new(buffer, 19) {
         Ok(e) => e,
         Err(_) => return Err(Status::InternalServerError),
     };
 
-    let mut compressed = Vec::new();
-    let mut not_compressed = Vec::new();
+    let mut compressed = vec![];
 
-    match file.read_to_end(&mut not_compressed) {
-        Ok(_) => (),
-        Err(_) => return Err(Status::InternalServerError),
-    };
-
-    match copy_encode(file, &mut encoder, 19) {
-        Ok(_) => (),
-        Err(_) => return Err(Status::InternalServerError),
-    };
-
-    // write the compressed data to a temporary file
-    let mut temp = match tempfile() {
-        Ok(t) => t,
-        Err(_) => return Err(Status::InternalServerError),
-    };
-
-    match encoder.finish().unwrap().read_to_end(&mut compressed) {
-        Ok(()) => (),
-        Err(_) => return Err(Status::InternalServerError),
+    if let Err(_) = encoder.finish().unwrap().read_to_end(&mut compressed) {
+        return Err(Status::InternalServerError);
     }
 
     // derive a file name from the original file name
@@ -63,7 +58,7 @@ fn compress<'a>(file: File) -> Result<Response<'a>, Status> {
             format!("attachment; filename=\"{}\"", file_name),
         ))
         .header(Header::new("Content-Type", "application/octet-stream"))
-        .streamed_body(Cursor::new(&compressed))
+        .streamed_body(Cursor::new(consume(&compressed)))
         .finalize();
 
     Ok(response)
